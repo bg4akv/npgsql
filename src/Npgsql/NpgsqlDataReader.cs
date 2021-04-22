@@ -34,7 +34,7 @@ namespace Npgsql
     {
         internal NpgsqlCommand Command { get; private set; } = default!;
         internal NpgsqlConnector Connector { get; }
-        NpgsqlConnection _connection = default!;
+        NpgsqlConnection? _connection;
 
         /// <summary>
         /// The behavior of the command with which this reader was executed.
@@ -89,7 +89,7 @@ namespace Npgsql
 
         /// <summary>
         /// The position in the buffer at which the current data row message ends.
-        /// Used only when the row is consumed non-sequentially. 
+        /// Used only when the row is consumed non-sequentially.
         /// </summary>
         int _dataMsgEnd;
 
@@ -140,6 +140,14 @@ namespace Npgsql
         /// </summary>
         char[]? _tempCharBuf;
 
+        /// <summary>
+        /// Used to keep track of every unique row this reader object ever traverses.
+        /// This is used to detect whether nested DbDataReaders are still valid.
+        /// </summary>
+        internal ulong UniqueRowId;
+
+        internal NpgsqlNestedDataReader? CachedFreeNestedDataReader;
+
         static readonly NpgsqlLogger Log = NpgsqlLogManager.CreateLogger(nameof(NpgsqlDataReader));
 
         internal NpgsqlDataReader(NpgsqlConnector connector)
@@ -151,7 +159,7 @@ namespace Npgsql
             NpgsqlCommand command, CommandBehavior behavior, List<NpgsqlStatement> statements, Task? sendTask = null)
         {
             Command = command;
-            _connection = command.Connection!;
+            _connection = command.Connection;
             _behavior = behavior;
             _isSchemaOnly = _behavior.HasFlag(CommandBehavior.SchemaOnly);
             _isSequential = _behavior.HasFlag(CommandBehavior.SequentialAccess);
@@ -175,6 +183,7 @@ namespace Npgsql
         {
             CheckClosedOrDisposed();
 
+            UniqueRowId++;
             var fastRead = TryFastRead();
             return fastRead.HasValue
                 ? fastRead.Value
@@ -192,6 +201,7 @@ namespace Npgsql
         {
             CheckClosedOrDisposed();
 
+            UniqueRowId++;
             var fastRead = TryFastRead();
             if (fastRead.HasValue)
                 return fastRead.Value ? PGUtil.TrueTask : PGUtil.FalseTask;
@@ -982,7 +992,7 @@ namespace Npgsql
             if (isDisposing)
                 State = ReaderState.Disposed;
 
-            if (_connection.ConnectorBindingScope == ConnectorBindingScope.Reader)
+            if (_connection?.ConnectorBindingScope == ConnectorBindingScope.Reader)
             {
                 // We may unbind the current reader, which also sets the connector to null
                 var connector = Connector;
@@ -1001,7 +1011,10 @@ namespace Npgsql
                 connector.ReaderCompleted.SetResult(null);
             }
             else if (_behavior.HasFlag(CommandBehavior.CloseConnection) && !connectionClosing)
+            {
+                Debug.Assert(_connection is not null);
                 _connection.Close();
+            }
 
             if (ReaderClosed != null)
             {
@@ -1187,6 +1200,50 @@ namespace Npgsql
         /// <param name="ordinal">The zero-based column ordinal.</param>
         /// <returns>The value of the specified column.</returns>
         public NpgsqlDateTime GetTimeStamp(int ordinal) => GetFieldValue<NpgsqlDateTime>(ordinal);
+
+        /// <inheritdoc />
+        protected override DbDataReader GetDbDataReader(int ordinal) => GetData(ordinal);
+
+        /// <summary>
+        /// Returns a nested data reader for the requested column.
+        /// The column type must be a record or a to Npgsql known composite type, or an array thereof.
+        /// Currently only supported in non-sequential mode.
+        /// </summary>
+        /// <param name="ordinal">The zero-based column ordinal.</param>
+        /// <returns>A data reader.</returns>
+        public new NpgsqlNestedDataReader GetData(int ordinal)
+        {
+            var field = CheckRowAndGetField(ordinal);
+            var type = field.PostgresType;
+            var isArray = type is PostgresArrayType;
+            var elementType = isArray ? ((PostgresArrayType)type).Element : type;
+            var compositeType = elementType as PostgresCompositeType;
+            if (elementType.InternalName != "record" && compositeType == null)
+                throw new InvalidCastException("GetData() not supported for type " + field.TypeDisplayName);
+
+            SeekToColumn(ordinal, false).GetAwaiter().GetResult();
+            if (ColumnLen == -1)
+                ThrowHelper.ThrowInvalidCastException_NoValue(field);
+
+            if (_isSequential)
+                throw new NotSupportedException("GetData() not supported in sequential mode.");
+
+            var reader = CachedFreeNestedDataReader;
+            if (reader != null)
+            {
+                CachedFreeNestedDataReader = null;
+                reader.Init(UniqueRowId, compositeType);
+            }
+            else
+            {
+                reader = new NpgsqlNestedDataReader(this, null, UniqueRowId, 1, compositeType);
+            }
+            if (isArray)
+                reader.InitArray();
+            else
+                reader.InitSingleRow();
+            return reader;
+        }
 
         #endregion
 
@@ -1865,7 +1922,7 @@ namespace Npgsql
         Task<ReadOnlyCollection<NpgsqlDbColumn>> GetColumnSchema(bool async, CancellationToken cancellationToken = default)
             => RowDescription == null || RowDescription.Count == 0
                 ? Task.FromResult(new List<NpgsqlDbColumn>().AsReadOnly())
-                : new DbColumnSchemaGenerator(_connection, RowDescription, _behavior.HasFlag(CommandBehavior.KeyInfo))
+                : new DbColumnSchemaGenerator(_connection!, RowDescription, _behavior.HasFlag(CommandBehavior.KeyInfo))
                     .GetColumnSchema(async, cancellationToken);
 
         #endregion
@@ -2080,6 +2137,8 @@ namespace Npgsql
         {
             Debug.Assert(State == ReaderState.InResult || State == ReaderState.BeforeResult);
 
+            UniqueRowId++;
+
             if (!CanConsumeRowNonSequentially)
                 return ConsumeRowSequential(async);
 
@@ -2204,7 +2263,7 @@ namespace Npgsql
                 throw new InvalidOperationException("The reader is closed");
             case ReaderState.Disposed:
                 throw new ObjectDisposedException(nameof(NpgsqlDataReader));
-            }          
+            }
         }
 
         #endregion

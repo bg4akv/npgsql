@@ -1,6 +1,8 @@
-﻿using Npgsql.Util;
+﻿using Npgsql.Internal;
+using Npgsql.Util;
 using System;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.Data;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
@@ -33,6 +35,7 @@ namespace Npgsql
                 var poolSettings = settings.Clone();
                 poolSettings.Host = host;
                 poolSettings.Port = port;
+                Debug.Assert(!poolSettings.Multiplexing);
                 _pools[i] = new ConnectorPool(poolSettings, poolSettings.ConnectionString, this);
             }
         }
@@ -85,9 +88,6 @@ namespace Npgsql
 
                 if (pool.TryGetIdleConnector(out var connector))
                 {
-                    conn.Connector = connector;
-                    connector.Connection = conn;
-
                     try
                     {
                         if (clusterState == ClusterState.Unknown)
@@ -96,8 +96,6 @@ namespace Npgsql
                             Debug.Assert(clusterState != ClusterState.Unknown);
                             if (!clusterValidator(clusterState, preferredType))
                             {
-                                conn.Connector = null;
-                                connector.Connection = null;
                                 pool.Return(connector);
                                 continue;
                             }
@@ -107,9 +105,6 @@ namespace Npgsql
                     }
                     catch (Exception ex)
                     {
-                        conn.FullState = ConnectionState.Connecting;
-                        conn.Connector = null;
-                        connector.Connection = null;
                         pool.Return(connector);
                         exceptions.Add(new NpgsqlException($"Unable to get an idle connection to {pool.Settings.Host}:{pool.Settings.Port}", ex));
                     }
@@ -142,28 +137,20 @@ namespace Npgsql
                     {
                         if (clusterState == ClusterState.Unknown)
                         {
-                            // Opening a new physical connection refreshed the cluster state, check again
-                            // Note that we purposefully ignore the expiration, as in case of the HostRecheckSeconds = 0
-                            // it will always be expired
-                            clusterState = GetClusterState(pool, ignoreExpiration: true);
+                            clusterState = await connector.QueryClusterState(new NpgsqlTimeout(timeoutPerHost), async, cancellationToken);
                             Debug.Assert(clusterState != ClusterState.Unknown);
                             if (!clusterValidator(clusterState, preferredType))
                             {
-                                conn.Connector = null;
-                                connector.Connection = null;
                                 pool.Return(connector);
                                 continue;
                             }
                         }
 
-                        conn.Connector = connector;
-                        connector.Connection = conn;
                         return connector;
                     }
                 }
                 catch (Exception ex)
                 {
-                    conn.FullState = ConnectionState.Connecting;
                     exceptions.Add(ex);
                 }
             }
@@ -202,27 +189,18 @@ namespace Npgsql
                         Debug.Assert(clusterState != ClusterState.Unknown);
                         if (!clusterValidator(clusterState, preferredType))
                         {
-                            conn.Connector = null;
-                            connector.Connection = null;
                             pool.Return(connector);
                             continue;
                         }
                     }
 
-                    conn.Connector = connector;
-                    connector.Connection = conn;
                     return connector;
                 }
                 catch (Exception ex)
                 {
                     if (connector is not null)
-                    {
-                        conn.Connector = null;
-                        connector.Connection = null;
                         pool.Return(connector);
-                    }
 
-                    conn.FullState = ConnectionState.Connecting;
                     exceptions.Add(new NpgsqlException($"Unable to connect to {pool.Settings.Host}:{pool.Settings.Port}", ex));
                 }
             }
@@ -237,7 +215,7 @@ namespace Npgsql
             var poolIndex = conn.Settings.LoadBalanceHosts ? GetRoundRobinIndex() : 0;
 
             var timeoutPerHost = timeout.IsSet ? timeout.CheckAndGetTimeLeft() : TimeSpan.Zero;
-            var preferredType = conn.Settings.TargetSessionAttributesParsed;
+            var preferredType = GetTargetSessionAttributes(conn);
             var checkUnpreferred =
                 preferredType == TargetSessionAttributes.PreferPrimary ||
                 preferredType == TargetSessionAttributes.PreferStandby;
@@ -256,7 +234,6 @@ namespace Npgsql
             if (connector is not null)
                 return connector;
 
-            conn.FullState = ConnectionState.Broken;
             throw NoSuitableHostsException(exceptions);
         }
 
@@ -268,10 +245,9 @@ namespace Npgsql
 
         int GetRoundRobinIndex()
         {
-            int index;
             while (true)
             {
-                index = Interlocked.Increment(ref _roundRobinIndex);
+                var index = Interlocked.Increment(ref _roundRobinIndex);
                 if (index >= 0)
                     return index % _pools.Length;
 
@@ -282,14 +258,11 @@ namespace Npgsql
                     _roundRobinIndex = 0;
                     return 0;
                 }
-                else
-                {
-                    // This is not the thread which wrapped around the counter - just wait until it's 0 or more
-                    var sw = new SpinWait();
-                    while (_roundRobinIndex < 0)
-                        sw.SpinOnce();
-                    continue;
-                }
+
+                // This is not the thread which wrapped around the counter - just wait until it's 0 or more
+                var sw = new SpinWait();
+                while (_roundRobinIndex < 0)
+                    sw.SpinOnce();
             }
         }
 
@@ -335,7 +308,7 @@ namespace Npgsql
                     connector = list[i];
                     var lastKnownState = GetClusterState(connector.Host, connector.Port, ignoreExpiration: true);
                     Debug.Assert(lastKnownState != ClusterState.Unknown);
-                    var preferredType = connection.Settings.TargetSessionAttributesParsed;
+                    var preferredType = GetTargetSessionAttributes(connection);
                     if (IsFallbackOrPreferred(lastKnownState, preferredType))
                     {
                         list.RemoveAt(i);
@@ -349,5 +322,11 @@ namespace Npgsql
                 return false;
             }
         }
+
+        static TargetSessionAttributes GetTargetSessionAttributes(NpgsqlConnection connection)
+            => connection.Settings.TargetSessionAttributesParsed ??
+               (PostgresEnvironment.TargetSessionAttributes is string s
+                   ? NpgsqlConnectionStringBuilder.ParseTargetSessionAttributes(s)
+                   : default);
     }
 }

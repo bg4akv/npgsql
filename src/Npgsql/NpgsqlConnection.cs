@@ -13,13 +13,13 @@ using System.Security.Cryptography.X509Certificates;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Transactions;
+using Npgsql.Internal;
 using Npgsql.Logging;
 using Npgsql.NameTranslation;
 using Npgsql.TypeMapping;
 using Npgsql.Util;
 using NpgsqlTypes;
 using IsolationLevel = System.Data.IsolationLevel;
-using static Npgsql.Util.Statics;
 
 namespace Npgsql
 {
@@ -182,8 +182,11 @@ namespace Npgsql
             var hostsSeparator = settings.Host?.IndexOf(',');
             if (hostsSeparator.HasValue && hostsSeparator == -1)
             {
-                if (settings.TargetSessionAttributesParsed != TargetSessionAttributes.Any)
-                    throw new NotSupportedException("TargetSessionAttributes other then Any is only supported with multiple hosts");
+                if (settings.TargetSessionAttributesParsed is not null &&
+                    settings.TargetSessionAttributesParsed != TargetSessionAttributes.Any)
+                {
+                    throw new NotSupportedException("Target Session Attributes other then Any is only supported with multiple hosts");
+                }
 
                 var portSeparator = settings.Host!.IndexOf(':');
                 if (!Path.IsPathRooted(settings.Host) && portSeparator != -1)
@@ -225,6 +228,8 @@ namespace Npgsql
                     throw new NotSupportedException("Pooling must be on with multiple hosts");
                 newPool = new MultiHostConnectorPool(settings, canonical);
             }
+            else if (settings.Multiplexing)
+                newPool = new MultiplexingConnectorPool(settings, canonical);
             else if (settings.Pooling)
                 newPool = new ConnectorPool(settings, canonical);
             else
@@ -274,7 +279,7 @@ namespace Npgsql
 
                 // If we've never connected with this connection string, open a physical connector in order to generate
                 // any exception (bad user/password, IP address...). This reproduces the standard error behavior.
-                if (!((ConnectorPool)Pool).IsBootstrapped)
+                if (!((MultiplexingConnectorPool)Pool).IsBootstrapped)
                     return BootstrapMultiplexing(async, cancellationToken);
 
                 CompleteOpen();
@@ -303,17 +308,17 @@ namespace Npgsql
                     // Otherwise just get a new connector and enlist below.
                     if (enlistToTransaction is not null && _pool.TryRentEnlistedPending(enlistToTransaction, this, out connector))
                     {
-                        connector.Connection = this;
                         EnlistedTransaction = enlistToTransaction;
                         enlistToTransaction = null;
                     }
                     else
                         connector = await _pool.Get(this, timeout, async, cancellationToken);
 
-                    Debug.Assert(connector.Connection == this,
-                        $"Connection for opened connector {Connector} isn't the same as this connection");
+                    Debug.Assert(connector.Connection is null,
+                        $"Connection for opened connector {Connector} is bound to another connection");
 
                     ConnectorBindingScope = ConnectorBindingScope.Connection;
+                    connector.Connection = this;
                     Connector = connector;
 
                     if (enlistToTransaction is not null)
@@ -347,7 +352,7 @@ namespace Npgsql
                 try
                 {
                     var timeout = new NpgsqlTimeout(TimeSpan.FromSeconds(ConnectionTimeout));
-                    await ((ConnectorPool)Pool).BootstrapMultiplexing(this, timeout, async, cancellationToken);
+                    await ((MultiplexingConnectorPool)Pool).BootstrapMultiplexing(this, timeout, async, cancellationToken);
                     CompleteOpen();
                 }
                 catch
@@ -1694,12 +1699,22 @@ namespace Npgsql
 
             async ValueTask<NpgsqlConnector> StartBindingScopeAsync()
             {
-                Debug.Assert(Settings.Multiplexing);
-                Debug.Assert(_pool != null);
+                try
+                {
+                    Debug.Assert(Settings.Multiplexing);
+                    Debug.Assert(_pool != null);
 
-                var connector = await _pool.Get(this, timeout, async, cancellationToken);
-                ConnectorBindingScope = scope;
-                return connector;
+                    var connector = await _pool.Get(this, timeout, async, cancellationToken);
+                    Connector = connector;
+                    connector.Connection = this;
+                    ConnectorBindingScope = scope;
+                    return connector;
+                }
+                catch
+                {
+                    FullState = ConnectionState.Broken;
+                    throw;
+                }
             }
         }
 
@@ -1989,11 +2004,6 @@ namespace Npgsql
         /// The connection is bound to its connector for the scope of a single reader.
         /// </summary>
         Reader,
-
-        /// <summary>
-        /// The connection is bound to its connector for the scope of establishing a new physical connection.
-        /// </summary>
-        PhysicalConnecting,
 
         /// <summary>
         /// The connection is bound to its connector for an unspecified, temporary scope; the code that initiated

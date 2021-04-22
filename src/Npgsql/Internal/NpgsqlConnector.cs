@@ -17,20 +17,19 @@ using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
 using Npgsql.BackendMessages;
-using Npgsql.Internal;
 using Npgsql.Logging;
 using Npgsql.TypeMapping;
 using Npgsql.Util;
 using static Npgsql.Util.Statics;
 using System.Transactions;
 
-namespace Npgsql
+namespace Npgsql.Internal
 {
     /// <summary>
     /// Represents a connection to a PostgreSQL backend. Unlike NpgsqlConnection objects, which are
     /// exposed to users, connectors are internal to Npgsql and are recycled by the connection pool.
     /// </summary>
-    sealed partial class NpgsqlConnector : IDisposable
+    public sealed partial class NpgsqlConnector : IDisposable
     {
         #region Fields and Properties
 
@@ -49,7 +48,10 @@ namespace Npgsql
         /// </summary>
         Stream _stream = default!;
 
-        internal NpgsqlConnectionStringBuilder Settings { get; }
+        /// <summary>
+        /// The parsed connection string.
+        /// </summary>
+        public NpgsqlConnectionStringBuilder Settings { get; }
 
         ProvideClientCertificatesCallback? ProvideClientCertificatesCallback { get; }
         RemoteCertificateValidationCallback? UserCertificateValidationCallback { get; }
@@ -97,7 +99,10 @@ namespace Npgsql
         /// </summary>
         internal int Id => BackendProcessId;
 
-        internal NpgsqlDatabaseInfo DatabaseInfo { get; private set; } = default!;
+        /// <summary>
+        /// Information about PostgreSQL and PostgreSQL-like databases (e.g. type definitions, capabilities...).
+        /// </summary>
+        public NpgsqlDatabaseInfo DatabaseInfo { get; private set; } = default!;
 
         internal ConnectorTypeMapper TypeMapper { get; set; } = default!;
 
@@ -293,14 +298,12 @@ namespace Npgsql
 
         #region Constructors
 
-        internal NpgsqlConnector(NpgsqlConnection connection, ConnectorSource connectorSource)
+        internal NpgsqlConnector(ConnectorSource connectorSource, NpgsqlConnection conn)
             : this(connectorSource)
         {
-            Connection = connection;
-            Connection.Connector = this;
-            ProvideClientCertificatesCallback = Connection.ProvideClientCertificatesCallback;
-            UserCertificateValidationCallback = Connection.UserCertificateValidationCallback;
-            ProvidePasswordCallback = Connection.ProvidePasswordCallback;
+            ProvideClientCertificatesCallback = conn.ProvideClientCertificatesCallback;
+            UserCertificateValidationCallback = conn.UserCertificateValidationCallback;
+            ProvidePasswordCallback = conn.ProvidePasswordCallback;
         }
 
         NpgsqlConnector(NpgsqlConnector connector)
@@ -359,7 +362,7 @@ namespace Npgsql
 
         internal string Host => Settings.Host!;
         internal int Port => Settings.Port;
-        string Database => Settings.Database!;
+        internal string Database => Settings.Database!;
         string KerberosServiceName => Settings.KerberosServiceName;
         SslMode SslMode => Settings.SslMode;
         int ConnectionTimeout => Settings.Timeout;
@@ -438,9 +441,8 @@ namespace Npgsql
         /// </summary>
         /// <remarks>Usually called by the RequestConnector
         /// Method of the connection pool manager.</remarks>
-        internal async Task Open(NpgsqlTimeout timeout, bool async, bool queryClusterState, CancellationToken cancellationToken)
+        internal async Task Open(NpgsqlTimeout timeout, bool async, CancellationToken cancellationToken)
         {
-            Debug.Assert(Connection != null && Connection.Connector == this);
             Debug.Assert(State == ConnectorState.Closed);
 
             State = ConnectorState.Connecting;
@@ -479,8 +481,6 @@ namespace Npgsql
                 }
 
                 await LoadDatabaseInfo(forceReload: false, timeout, async, cancellationToken);
-                if (queryClusterState)
-                    await QueryClusterState(timeout, async, cancellationToken);
 
                 if (Settings.Pooling && !Settings.Multiplexing && !Settings.NoResetOnClose && DatabaseInfo.SupportsDiscard)
                 {
@@ -529,12 +529,6 @@ namespace Npgsql
         internal async ValueTask LoadDatabaseInfo(bool forceReload, NpgsqlTimeout timeout, bool async,
             CancellationToken cancellationToken = default)
         {
-            // Super hacky stuff...
-
-            var prevBindingScope = Connection!.ConnectorBindingScope;
-            Connection.ConnectorBindingScope = ConnectorBindingScope.PhysicalConnecting;
-            using var _ = Defer(static (conn, prevScope) => conn.ConnectorBindingScope = prevScope, Connection, prevBindingScope);
-
             // The type loading below will need to send queries to the database, and that depends on a type mapper
             // being set up (even if its empty)
             TypeMapper = new ConnectorTypeMapper(this);
@@ -554,8 +548,7 @@ namespace Npgsql
                 {
                     if (forceReload || !NpgsqlDatabaseInfo.Cache.TryGetValue(key, out database))
                     {
-                        NpgsqlDatabaseInfo.Cache[key] = database = await NpgsqlDatabaseInfo.Load(Connection,
-                            timeout, async);
+                        NpgsqlDatabaseInfo.Cache[key] = database = await NpgsqlDatabaseInfo.Load(this, timeout, async);
                     }
                 }
                 finally
@@ -571,13 +564,7 @@ namespace Npgsql
         internal async ValueTask<ClusterState> QueryClusterState(
             NpgsqlTimeout timeout, bool async, CancellationToken cancellationToken = default)
         {
-            // Super hacky stuff...
-
-            var prevBindingScope = Connection!.ConnectorBindingScope;
-            Connection.ConnectorBindingScope = ConnectorBindingScope.PhysicalConnecting;
-            using var _ = Defer(static (conn, prevScope) => conn.ConnectorBindingScope = prevScope, Connection, prevBindingScope);
-
-            using var cmd = new NpgsqlCommand("select pg_is_in_recovery(); SHOW default_transaction_read_only", Connection);
+            using var cmd = CreateCommand("select pg_is_in_recovery(); SHOW default_transaction_read_only");
             cmd.CommandTimeout = (int)timeout.CheckAndGetTimeLeft().TotalSeconds;
             // We're taking the timestamp before the query is sent, because due to issues (IO, operation ordering, etc) we can receive an
             // 'old' state. Otherwise, execution of the query shouldn't make notable difference.
@@ -646,7 +633,7 @@ namespace Npgsql
             if (username?.Length > 0)
                 return username;
 
-            if (!PGUtil.IsWindows)
+            if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
             {
                 username = KerberosUsernameProvider.GetUsername(Settings.IncludeRealm);
                 if (username?.Length > 0)
@@ -718,10 +705,17 @@ namespace Npgsql
                             {
 #if NET5_0
                                 // It's PEM time
-                                var keyPath = Settings.SslKey ?? PostgresEnvironment.SslKey;
+                                var keyPath = Settings.SslKey ?? PostgresEnvironment.SslKey ?? PostgresEnvironment.SslKeyDefault;
                                 cert = string.IsNullOrEmpty(password)
                                     ? X509Certificate2.CreateFromPemFile(certPath, keyPath)
                                     : X509Certificate2.CreateFromEncryptedPemFile(certPath, password, keyPath);
+                                if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                                {
+                                    // Windows crypto API has a bug with pem certs
+                                    // See #3650
+                                    using var previousCert = cert;
+                                    cert = new X509Certificate2(cert.Export(X509ContentType.Pkcs12));
+                                }
 #else
                                 throw new NotSupportedException("PEM certificates are only supported with .NET 5 and higher");
 #endif
@@ -749,10 +743,10 @@ namespace Npgsql
 
                             if (async)
                                 await sslStream.AuthenticateAsClientAsync(Host, clientCertificates,
-                                    SslProtocols.Tls | SslProtocols.Tls11 | SslProtocols.Tls12, Settings.CheckCertificateRevocation);
+                                    SslProtocols.None, Settings.CheckCertificateRevocation);
                             else
                                 sslStream.AuthenticateAsClient(Host, clientCertificates,
-                                    SslProtocols.Tls | SslProtocols.Tls11 | SslProtocols.Tls12, Settings.CheckCertificateRevocation);
+                                    SslProtocols.None, Settings.CheckCertificateRevocation);
 
                             _stream = sslStream;
                         }
@@ -1509,7 +1503,23 @@ namespace Npgsql
                 if (certificate is null || chain is null)
                     return false;
 
-                chain.ChainPolicy.ExtraStore.Add(new X509Certificate2(certRootPath));
+                var certs = new X509Certificate2Collection();
+
+#if NET5_0
+                if (Path.GetExtension(certRootPath).ToUpperInvariant() != ".PFX")
+                    certs.ImportFromPemFile(certRootPath);
+#endif
+
+                if (certs.Count == 0)
+                    certs.Add(new X509Certificate2(certRootPath));
+
+#if NET5_0
+                chain.ChainPolicy.CustomTrustStore.AddRange(certs);
+                chain.ChainPolicy.TrustMode = X509ChainTrustMode.CustomRootTrust;
+#endif
+
+                chain.ChainPolicy.ExtraStore.AddRange(certs);
+
                 return chain.Build(certificate as X509Certificate2 ?? new X509Certificate2(certificate));
             };
 
@@ -1762,6 +1772,7 @@ namespace Npgsql
 
         internal void Return() => _connectorSource.Return(this);
 
+        /// <inheritdoc />
         public void Dispose() => Close();
 
         /// <summary>
@@ -2339,6 +2350,13 @@ namespace Npgsql
         #endregion
 
         #region Misc
+
+        /// <summary>
+        /// Creates and returns a <see cref="NpgsqlCommand"/> object associated with the <see cref="NpgsqlConnector"/>.
+        /// </summary>
+        /// <param name="cmdText">The text of the query.</param>
+        /// <returns>A <see cref="NpgsqlCommand"/> object.</returns>
+        public NpgsqlCommand CreateCommand(string? cmdText = null) => new(cmdText, this);
 
         void ReadParameterStatus(ReadOnlySpan<byte> incomingName, ReadOnlySpan<byte> incomingValue)
         {

@@ -13,7 +13,7 @@ using Npgsql.BackendMessages;
 using Npgsql.Util;
 using static Npgsql.Util.Statics;
 
-namespace Npgsql
+namespace Npgsql.Internal
 {
     partial class NpgsqlConnector
     {
@@ -460,12 +460,7 @@ namespace Npgsql
             if (password != null)
                 return password;
 
-            var passFile = Settings.Passfile ?? PostgresEnvironment.PassFile;
-            if (passFile is null && PostgresEnvironment.PassFileDefault is string passFileDefault)
-            {
-                passFile = passFileDefault;
-            }
-
+            var passFile = Settings.Passfile ?? PostgresEnvironment.PassFile ?? PostgresEnvironment.PassFileDefault;
             if (passFile != null)
             {
                 var matchingEntry = new PgPassFile(passFile!)

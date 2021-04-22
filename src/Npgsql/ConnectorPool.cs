@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Data;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
@@ -6,12 +7,13 @@ using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
 using System.Transactions;
+using Npgsql.Internal;
 using Npgsql.Logging;
 using Npgsql.Util;
 
 namespace Npgsql
 {
-    sealed partial class ConnectorPool : ConnectorSource
+    class ConnectorPool : ConnectorSource
     {
         #region Fields and properties
 
@@ -19,16 +21,7 @@ namespace Npgsql
 
         readonly int _max;
         readonly int _min;
-        readonly bool _autoPrepare;
         readonly TimeSpan _connectionLifetime;
-
-        public bool IsBootstrapped
-        {
-            get => _isBootstrapped;
-            set => _isBootstrapped = value;
-        }
-
-        volatile bool _isBootstrapped;
 
         volatile int _numConnectors;
 
@@ -42,9 +35,7 @@ namespace Npgsql
         /// Tracks all connectors currently managed by this pool, whether idle or busy.
         /// Only updated rarely - when physical connections are opened/closed - but is read in perf-sensitive contexts.
         /// </summary>
-        readonly NpgsqlConnector?[] _connectors;
-
-        readonly bool _multiplexing;
+        private protected readonly NpgsqlConnector?[] Connectors;
 
         readonly MultiHostConnectorPool? _parentPool;
 
@@ -73,12 +64,9 @@ namespace Npgsql
 
         static readonly SingleThreadSynchronizationContext SingleThreadSynchronizationContext = new("NpgsqlRemainingAsyncSendWorker");
 
-        // TODO: Make this configurable
-        const int MultiexingCommandChannelBound = 4096;
-
         #endregion
 
-        internal override (int Total, int Idle, int Busy) Statistics
+        internal sealed override (int Total, int Idle, int Busy) Statistics
         {
             get
             {
@@ -122,49 +110,15 @@ namespace Npgsql
 
             _max = settings.MaxPoolSize;
             _min = settings.MinPoolSize;
-            _autoPrepare = settings.MaxAutoPrepare > 0;
             _connectionLifetime = TimeSpan.FromSeconds(settings.ConnectionLifetime);
-            _connectors = new NpgsqlConnector[_max];
-
-            // TODO: Validate multiplexing options are set only when Multiplexing is on
-
-            if (Settings.Multiplexing)
-            {
-                _multiplexing = true;
-
-                _bootstrapSemaphore = new SemaphoreSlim(1);
-
-                // Translate microseconds to ticks for cancellation token
-                _writeCoalescingDelayTicks = Settings.WriteCoalescingDelayUs * 100;
-                _writeCoalescingBufferThresholdBytes = Settings.WriteCoalescingBufferThresholdBytes;
-
-                var multiplexCommandChannel = Channel.CreateBounded<NpgsqlCommand>(
-                    new BoundedChannelOptions(MultiexingCommandChannelBound)
-                    {
-                        FullMode = BoundedChannelFullMode.Wait,
-                        SingleReader = true
-                    });
-                _multiplexCommandReader = multiplexCommandChannel.Reader;
-                MultiplexCommandWriter = multiplexCommandChannel.Writer;
-
-                // TODO: Think about cleanup for this, e.g. completing the channel at application shutdown and/or
-                // pool clearing
-
-                _ = Task.Run(MultiplexingWriteLoop)
-                    .ContinueWith(t =>
-                    {
-                        // Note that we *must* observe the exception if the task is faulted.
-                        Log.Error("Exception in multiplexing write loop, this is an Npgsql bug, please file an issue.",
-                            t.Exception!);
-                    }, TaskContinuationOptions.OnlyOnFaulted);
-            }
+            Connectors = new NpgsqlConnector[_max];
         }
 
-        internal override ValueTask<NpgsqlConnector> Get(
+        internal sealed override ValueTask<NpgsqlConnector> Get(
             NpgsqlConnection conn, NpgsqlTimeout timeout, bool async, CancellationToken cancellationToken)
         {
             return TryGetIdleConnector(out var connector)
-                ? new ValueTask<NpgsqlConnector>(AssignConnection(conn, connector))
+                ? new ValueTask<NpgsqlConnector>(connector)
                 : RentAsync(conn, timeout, async, cancellationToken);
 
             async ValueTask<NpgsqlConnector> RentAsync(
@@ -173,7 +127,7 @@ namespace Npgsql
                 // First, try to open a new physical connector. This will fail if we're at max capacity.
                 var connector = await OpenNewConnector(conn, timeout, async, cancellationToken);
                 if (connector != null)
-                    return AssignConnection(conn, connector);
+                    return connector;
 
                 // We're at max capacity. Block on the idle channel with a timeout.
                 // Note that Channels guarantee fair FIFO behavior to callers of ReadAsync (first-come first-
@@ -190,7 +144,7 @@ namespace Npgsql
                         {
                             connector = await _idleConnectorReader.ReadAsync(finalToken);
                             if (CheckIdleConnector(connector))
-                                return AssignConnection(conn, connector);
+                                return connector;
                         }
                         else
                         {
@@ -224,21 +178,14 @@ namespace Npgsql
                     // If we're here, our waiting attempt on the idle connector channel was released with a null
                     // (or bad connector), or we're in sync mode. Check again if a new idle connector has appeared since we last checked.
                     if (TryGetIdleConnector(out connector))
-                        return AssignConnection(conn, connector);
+                        return connector;
 
                     // We might have closed a connector in the meantime and no longer be at max capacity
                     // so try to open a new connector and if that fails, loop again.
                     connector = await OpenNewConnector(conn, timeout, async, cancellationToken);
                     if (connector != null)
-                        return AssignConnection(conn, connector);
+                        return connector;
                 }
-            }
-
-            static NpgsqlConnector AssignConnection(NpgsqlConnection connection, NpgsqlConnector connector)
-            {
-                connector.Connection = connection;
-                connection.Connector = connector;
-                return connector;
             }
         }
 
@@ -307,18 +254,17 @@ namespace Npgsql
                 try
                 {
                     // We've managed to increase the open counter, open a physical connections.
-                    var connector = new NpgsqlConnector(conn, this) { ClearCounter = _clearCounter };
-                    var queryClusterState = _parentPool is not null && Settings.ReplicationMode == ReplicationMode.Off;
-                    await connector.Open(timeout, async, queryClusterState, cancellationToken);
+                    var connector = new NpgsqlConnector(this, conn) { ClearCounter = _clearCounter };
+                    await connector.Open(timeout, async, cancellationToken);
 
                     var i = 0;
                     for (; i < _max; i++)
-                        if (Interlocked.CompareExchange(ref _connectors[i], connector, null) == null)
+                        if (Interlocked.CompareExchange(ref Connectors[i], connector, null) == null)
                             break;
 
-                    Debug.Assert(i < _max, $"Could not find free slot in {_connectors} when opening.");
+                    Debug.Assert(i < _max, $"Could not find free slot in {Connectors} when opening.");
                     if (i == _max)
-                        throw new NpgsqlException($"Could not find free slot in {_connectors} when opening. Please report a bug.");
+                        throw new NpgsqlException($"Could not find free slot in {Connectors} when opening. Please report a bug.");
 
                     // Only start pruning if it was this thread that incremented open count past _min.
                     if (numConnectors == _min)
@@ -329,7 +275,6 @@ namespace Npgsql
                 catch
                 {
                     // Physical open failed, decrement the open and busy counter back down.
-                    conn.Connector = null;
                     Interlocked.Decrement(ref _numConnectors);
 
                     // In case there's a waiting attempt on the channel, we write a null to the idle connector channel
@@ -343,7 +288,7 @@ namespace Npgsql
             return null;
         }
 
-        internal override void Return(NpgsqlConnector connector)
+        internal sealed override void Return(NpgsqlConnector connector)
         {
             Debug.Assert(!connector.InTransaction);
             Debug.Assert(connector.MultiplexAsyncWritingLock == 0 || connector.IsBroken || connector.IsClosed,
@@ -396,12 +341,12 @@ namespace Npgsql
 
             var i = 0;
             for (; i < _max; i++)
-                if (Interlocked.CompareExchange(ref _connectors[i], null, connector) == connector)
+                if (Interlocked.CompareExchange(ref Connectors[i], null, connector) == connector)
                     break;
 
-            Debug.Assert(i < _max, $"Could not find free slot in {_connectors} when closing.");
+            Debug.Assert(i < _max, $"Could not find free slot in {Connectors} when closing.");
             if (i == _max)
-                throw new NpgsqlException($"Could not find free slot in {_connectors} when closing. Please report a bug.");
+                throw new NpgsqlException($"Could not find free slot in {Connectors} when closing. Please report a bug.");
 
             var numConnectors = Interlocked.Decrement(ref _numConnectors);
             Debug.Assert(numConnectors >= 0);
